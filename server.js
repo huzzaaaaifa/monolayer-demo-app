@@ -246,6 +246,39 @@ async function fetchWithTimeout(url, ms) {
 }
 
 // ---------------------------------------------------------------------------
+// Environment variables — proves the platform actually injected this service's
+// env (SSM Parameter Store / Secrets Manager → container). Set/rename/remove a
+// var in Monolayer, redeploy, and reload: it appears/updates/disappears here.
+// The disappear case is the important one — it proves the SSM backend's
+// delete-on-remove reconciliation, which a Secrets Manager blob got for free.
+//
+// Baseline container/runtime vars are hidden as noise, and any value whose NAME
+// looks like a credential is masked — this page is served on a PUBLIC ALB, so it
+// must never print a real DATABASE_URL/password. You still see the KEY exists and
+// its length, which is enough to confirm injection.
+// ---------------------------------------------------------------------------
+const HIDDEN_ENV = new Set(['PATH', 'HOME', 'HOSTNAME', 'PWD', 'SHLVL', 'TERM', 'NODE_VERSION', 'YARN_VERSION', 'NODE_ENV', '_'])
+const SENSITIVE_ENV = /PASS|SECRET|TOKEN|CREDENTIAL|PRIVATE|_KEY$|^KEY|DATABASE_URL|REDIS_URL|CONNECTION|_URL$/i
+
+function envReport() {
+  const rows = Object.keys(process.env)
+    .filter((k) => !HIDDEN_ENV.has(k))
+    .sort()
+    .map((k) => {
+      const raw = process.env[k] ?? ''
+      return { name: k, value: SENSITIVE_ENV.test(k) ? `••••••• (set, ${raw.length} chars)` : raw }
+    })
+  return {
+    status: rows.length ? 'ok' : 'none',
+    title: `Environment variables (${rows.length})`,
+    detail: rows.length
+      ? 'Injected into this container by Monolayer. Set/rename/remove one, redeploy, and reload — a removed var must disappear here (delete-on-remove reconciliation). Credential-looking names are masked.'
+      : 'No environment variables set — add some in Monolayer, then redeploy.',
+    rows,
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Rendering. "/" is a static shell that fetches /api/status from the browser —
 // deliberately, for three reasons that all bit during demo prep:
 //   1. The shared ALB health-checks "/" with a 5s timeout every 15s; running the
@@ -308,7 +341,7 @@ const SHELL_HTML = `<!doctype html>
     fetch('/api/status').then((r) => r.json()).then((j) => {
       const cards = document.getElementById('cards')
       cards.replaceChildren()
-      for (const item of [j.database, ...j.buckets, j.volume, ...j.services]) cards.appendChild(card(item))
+      for (const item of [j.env, j.database, ...j.buckets, j.volume, ...j.services]) cards.appendChild(card(item))
     }).catch((err) => {
       document.getElementById('cards').replaceChildren(card({ status: 'error', title: 'Status check', detail: String(err) }))
     })
@@ -322,7 +355,7 @@ app.get('/', (req, res) => {
 
 app.get('/api/status', async (req, res) => {
   const [db, buckets, volume, services] = await Promise.all([checkDatabase(), checkBuckets(), checkVolume(), checkServices()])
-  res.json({ hostname: HOSTNAME, database: db, buckets, volume, services })
+  res.json({ hostname: HOSTNAME, env: envReport(), database: db, buckets, volume, services })
 })
 
 app.listen(PORT, '0.0.0.0', () => {
