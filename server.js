@@ -257,12 +257,18 @@ async function fetchWithTimeout(url, ms) {
 // must never print a real DATABASE_URL/password. You still see the KEY exists and
 // its length, which is enough to confirm injection.
 // ---------------------------------------------------------------------------
-const HIDDEN_ENV = new Set(['PATH', 'HOME', 'HOSTNAME', 'PWD', 'SHLVL', 'TERM', 'NODE_VERSION', 'YARN_VERSION', 'NODE_ENV', '_'])
+const HIDDEN_ENV = new Set(['PATH', 'HOME', 'HOSTNAME', 'PWD', 'SHLVL', 'TERM', 'NODE', 'NODE_VERSION', 'YARN_VERSION', 'NODE_ENV', 'INIT_CWD', 'CI', 'COLOR', 'EDITOR', 'AWS_EXECUTION_ENV', '_'])
+// Build/runtime injectors — Railpack/mise, npm, the ECS agent — flood the container with
+// dozens of vars that aren't yours (npm_config_*, MISE_*, ECS_*). Hide those prefixes so
+// the card shows what you actually SET plus connection-injected vars, which is the whole
+// point of this test tool. Heuristic: a different builder may introduce new noise prefixes.
+const HIDDEN_ENV_PREFIX = ['npm_', 'NPM_', 'MISE_', '__MISE', 'ECS_', 'AWS_CONTAINER_CREDENTIALS']
+const envHidden = (k) => HIDDEN_ENV.has(k) || HIDDEN_ENV_PREFIX.some((p) => k.startsWith(p))
 const SENSITIVE_ENV = /PASS|SECRET|TOKEN|CREDENTIAL|PRIVATE|_KEY$|^KEY|DATABASE_URL|REDIS_URL|CONNECTION|_URL$/i
 
 function envReport() {
   const rows = Object.keys(process.env)
-    .filter((k) => !HIDDEN_ENV.has(k))
+    .filter((k) => !envHidden(k))
     .sort()
     .map((k) => {
       const raw = process.env[k] ?? ''
