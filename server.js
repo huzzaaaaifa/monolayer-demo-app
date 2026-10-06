@@ -1,367 +1,252 @@
-// Monolayer connection demo app — deploy this as an "ec2" or "ecs" service (git-connected,
-// Railpack builds it automatically, no Dockerfile needed) and connect it on the canvas to a
-// database, an S3 bucket, a volume, and/or another service. Reload "/" after each connection
-// (and redeploy) to see that connection go from "not connected" to a live, working example.
-//
-// Nothing here is guessed: every env var name below matches exactly what the Monolayer app
-// backend's connection resolver actually injects (see webhook.go's connectionEnv/dbConnections,
-// and the operator's composeDBEnv) — this app just reads them and proves each one works.
-
+/**
+ * Monolayer Canvas demo — hardcoded sign-in only.
+ * Credentials are shown on the login page on purpose (demo, not production).
+ */
+const crypto = require('crypto')
 const express = require('express')
-const os = require('os')
-const fs = require('fs/promises')
-const path = require('path')
 
-const PORT = process.env.PORT || 3000
-const HOSTNAME = os.hostname()
+const PORT = Number(process.env.PORT) || 3000
+const COOKIE = 'ml_demo_session'
+const SECRET = process.env.SESSION_SECRET || 'monolayer-demo-not-secret'
+
+/** Demo accounts — also printed on the login UI. */
+const USERS = [
+  { username: 'demo', password: 'demo123', name: 'Demo User', role: 'Member' },
+  { username: 'admin', password: 'admin123', name: 'Admin User', role: 'Admin' },
+]
+
+const sessions = new Map() // id -> username
 
 const app = express()
+app.use(express.urlencoded({ extended: false }))
+app.use(express.json())
 
-// ---------------------------------------------------------------------------
-// Database — DATABASE_URL (postgres/mysql/oracle/mongodb) or REDIS_URL.
-// One heartbeat row/document is written and the most recent few are read back,
-// so reloading the page after a redeploy proves the connection AND that the
-// data actually persisted in the database (not just that a socket opened).
-// ---------------------------------------------------------------------------
-async function checkDatabase() {
-  const url = process.env.DATABASE_URL
-  const redisUrl = process.env.REDIS_URL
-  if (!url && !redisUrl) {
-    return { status: 'none', title: 'Database', detail: 'No DATABASE_URL or REDIS_URL — connect this service to a database on the canvas, then redeploy.' }
-  }
-  if (redisUrl) return checkRedis(redisUrl)
-
-  const scheme = url.split('://')[0]
-  try {
-    if (scheme === 'postgres' || scheme === 'postgresql') return await checkPostgres(url)
-    if (scheme === 'mysql') return await checkMysql(url)
-    if (scheme === 'mongodb') return await checkMongo(url)
-    if (scheme === 'oracle') return checkOracleUnsupported()
-    return { status: 'warn', title: 'Database', detail: `DATABASE_URL has an unrecognized scheme ("${scheme}") — the demo app doesn't know how to query it.` }
-  } catch (err) {
-    return { status: 'error', title: 'Database', detail: `Connected env vars are present but the query failed: ${err.message}` }
-  }
+function sign(value) {
+  return crypto.createHmac('sha256', SECRET).update(value).digest('hex').slice(0, 24)
 }
 
-async function checkPostgres(url) {
-  const { Pool } = require('pg')
-  // RDS/Aurora PostgreSQL 15+ ships with rds.force_ssl=1 — a plain connection is
-  // rejected outright. Always negotiate TLS; skipping CA verification is a
-  // demo-only shortcut (production: pin the RDS CA bundle).
-  const pool = new Pool({ connectionString: url, connectionTimeoutMillis: 5000, ssl: { rejectUnauthorized: false } })
-  try {
-    await pool.query(`CREATE TABLE IF NOT EXISTS monolayer_demo (id SERIAL PRIMARY KEY, hostname TEXT, created_at TIMESTAMPTZ DEFAULT now())`)
-    await pool.query(`INSERT INTO monolayer_demo (hostname) VALUES ($1)`, [HOSTNAME])
-    const { rows } = await pool.query(`SELECT id, hostname, created_at FROM monolayer_demo ORDER BY id DESC LIMIT 5`)
-    return { status: 'ok', title: 'Database (Postgres)', detail: `Inserted a heartbeat row and read it back. Last ${rows.length}:`, rows }
-  } finally {
-    await pool.end()
-  }
+function setSession(res, username) {
+  const id = crypto.randomBytes(16).toString('hex')
+  sessions.set(id, username)
+  const token = `${id}.${sign(id)}`
+  res.setHeader(
+    'Set-Cookie',
+    `${COOKIE}=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${60 * 60 * 8}`,
+  )
 }
 
-async function checkMysql(url) {
-  const mysql = require('mysql2/promise')
-  // Plain first; retry over TLS if the server demands it (require_secure_transport).
-  let conn
-  try {
-    conn = await mysql.createConnection({ uri: url, connectTimeout: 5000 })
-  } catch (err) {
-    conn = await mysql.createConnection({ uri: url, connectTimeout: 5000, ssl: { rejectUnauthorized: false } })
+function clearSession(res, req) {
+  const user = currentUser(req)
+  const raw = parseCookie(req)[COOKIE]
+  if (raw) {
+    const id = raw.split('.')[0]
+    sessions.delete(id)
   }
-  try {
-    await conn.query(`CREATE TABLE IF NOT EXISTS monolayer_demo (id INT AUTO_INCREMENT PRIMARY KEY, hostname VARCHAR(255), created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`)
-    await conn.query(`INSERT INTO monolayer_demo (hostname) VALUES (?)`, [HOSTNAME])
-    const [rows] = await conn.query(`SELECT id, hostname, created_at FROM monolayer_demo ORDER BY id DESC LIMIT 5`)
-    return { status: 'ok', title: 'Database (MySQL)', detail: `Inserted a heartbeat row and read it back. Last ${rows.length}:`, rows }
-  } finally {
-    await conn.end()
-  }
+  res.setHeader('Set-Cookie', `${COOKIE}=; Path=/; HttpOnly; Max-Age=0`)
+  return user
 }
 
-async function checkMongo(url) {
-  const { MongoClient } = require('mongodb')
-  // DocumentDB terminates TLS with a cert chain most Node trust stores don't have
-  // by default — relaxing verification here is a demo-only shortcut, not something
-  // to carry into production (pin the RDS CA bundle instead).
-  const client = new MongoClient(url, { serverSelectionTimeoutMS: 5000, tlsAllowInvalidCertificates: true })
-  try {
-    await client.connect()
-    const col = client.db('monolayer_demo').collection('visits')
-    await col.insertOne({ hostname: HOSTNAME, created_at: new Date() })
-    const rows = await col.find().sort({ _id: -1 }).limit(5).toArray()
-    return {
-      status: 'ok',
-      title: 'Database (DocumentDB / MongoDB)',
-      detail: `Inserted a heartbeat document and read it back. Last ${rows.length}:`,
-      rows: rows.map((r) => ({ id: String(r._id), hostname: r.hostname, created_at: r.created_at })),
-    }
-  } finally {
-    await client.close()
+function parseCookie(req) {
+  const out = {}
+  const header = req.headers.cookie || ''
+  for (const part of header.split(';')) {
+    const i = part.indexOf('=')
+    if (i === -1) continue
+    out[part.slice(0, i).trim()] = decodeURIComponent(part.slice(i + 1).trim())
   }
+  return out
 }
 
-function checkOracleUnsupported() {
-  return {
-    status: 'warn',
-    title: 'Database (Oracle)',
-    detail: 'DATABASE_URL/ORACLE_* env vars are present, confirming the connection resolved — but this demo app has no bundled Oracle driver (needs the Oracle Instant Client native libraries). Env vars present: ' +
-      ['ORACLE_HOST', 'ORACLE_PORT', 'ORACLE_USER', 'ORACLE_DATABASE'].filter((k) => process.env[k]).join(', '),
-  }
+function currentUser(req) {
+  const raw = parseCookie(req)[COOKIE]
+  if (!raw) return null
+  const [id, sig] = raw.split('.')
+  if (!id || !sig || sign(id) !== sig) return null
+  const username = sessions.get(id)
+  if (!username) return null
+  return USERS.find((u) => u.username === username) || null
 }
 
-async function checkRedis(url) {
-  const Redis = require('ioredis')
-  const redis = new Redis(url, { connectTimeout: 5000, maxRetriesPerRequest: 1, lazyConnect: true })
-  try {
-    await redis.connect()
-    const visits = await redis.incr('monolayer:demo:visits')
-    await redis.lpush('monolayer:demo:log', `${new Date().toISOString()} ${HOSTNAME}`)
-    await redis.ltrim('monolayer:demo:log', 0, 4)
-    const log = await redis.lrange('monolayer:demo:log', 0, 4)
-    return { status: 'ok', title: 'Database (Redis)', detail: `Incremented a visit counter (now ${visits}) and pushed a log entry. Last ${log.length}:`, rows: log.map((l) => ({ entry: l })) }
-  } finally {
-    redis.disconnect()
-  }
-}
-
-// ---------------------------------------------------------------------------
-// S3 buckets — <PREFIX>_BUCKET_NAME (+ plain BUCKET_NAME when exactly one
-// bucket is connected). Uploads a small object, lists the bucket, and reads
-// the object straight back to prove read AND write access.
-// ---------------------------------------------------------------------------
-async function checkBuckets() {
-  const names = new Set()
-  if (process.env.BUCKET_NAME) names.add(process.env.BUCKET_NAME)
-  for (const [key, value] of Object.entries(process.env)) {
-    if (key.endsWith('_BUCKET_NAME') && value) names.add(value)
-  }
-  if (names.size === 0) {
-    return [{ status: 'none', title: 'S3 bucket', detail: 'No *_BUCKET_NAME — connect this service to an S3 bucket resource on the canvas, then redeploy.' }]
-  }
-  const { S3Client, PutObjectCommand, ListObjectsV2Command, GetObjectCommand } = require('@aws-sdk/client-s3')
-  // Neither EC2 user-data containers nor ECS reliably export AWS_REGION, and SDK v3
-  // throws "Region is missing" rather than probing IMDS for it. Fall back to
-  // us-east-1 and let followRegionRedirects chase the bucket's real region.
-  const s3 = new S3Client({
-    region: process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || 'us-east-1',
-    followRegionRedirects: true,
-  })
-  const results = []
-  for (const bucket of names) {
-    try {
-      const key = `monolayer-demo/${HOSTNAME}-${Date.now()}.txt`
-      const body = `Written by ${HOSTNAME} at ${new Date().toISOString()}`
-      await s3.send(new PutObjectCommand({ Bucket: bucket, Key: key, Body: body, ContentType: 'text/plain' }))
-      const listed = await s3.send(new ListObjectsV2Command({ Bucket: bucket, Prefix: 'monolayer-demo/', MaxKeys: 10 }))
-      const got = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: key }))
-      const readBack = await got.Body.transformToString()
-      results.push({
-        status: 'ok',
-        title: `S3 bucket: ${bucket}`,
-        detail: `Uploaded "${key}", listed ${listed.KeyCount ?? 0} object(s) under monolayer-demo/, and read the upload back: "${readBack}"`,
-      })
-    } catch (err) {
-      results.push({ status: 'error', title: `S3 bucket: ${bucket}`, detail: `Env var present but the S3 call failed: ${err.message}` })
-    }
-  }
-  return results
-}
-
-// ---------------------------------------------------------------------------
-// EBS volume — no env var carries the mount path (it's whatever you typed into
-// the canvas "Attach volume" dialog, default /data), so this is set via
-// DEMO_VOLUME_PATH on the service itself. Appends to a log file and reads the
-// tail back — reload after a redeploy to see the log survive (ec2) or reset
-// (ecs — a known, documented platform limitation, not a bug in this app).
-// ---------------------------------------------------------------------------
-async function checkVolume() {
-  const dir = process.env.DEMO_VOLUME_PATH || '/data'
-  const file = path.join(dir, 'monolayer-demo.log')
-  try {
-    await fs.appendFile(file, `${new Date().toISOString()} ${HOSTNAME}\n`)
-    const content = await fs.readFile(file, 'utf8')
-    const lines = content.trim().split('\n').slice(-5)
-    return { status: 'ok', title: `Volume (${dir})`, detail: `Appended a line and read the file back. Last ${lines.length}:`, rows: lines.map((l) => ({ entry: l })) }
-  } catch (err) {
-    if (err.code === 'ENOENT') {
-      return { status: 'none', title: `Volume (${dir})`, detail: `Nothing mounted at ${dir} — connect this service to a volume on the canvas (mount path must match DEMO_VOLUME_PATH), then redeploy.` }
-    }
-    return { status: 'error', title: `Volume (${dir})`, detail: `Path exists but couldn't be written: ${err.message}` }
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Service-to-service — <PREFIX><NAME>_URL (public, every service pair) and
-// <PREFIX><NAME>_PRIVATE_URL (VPC-internal, ec2/ecs targets only — see the
-// internal ALB work). Calls whichever are present and shows the response, so
-// a Lambda connected to this service side-by-side proves both paths reach it.
-// ---------------------------------------------------------------------------
-async function checkServices() {
-  const skip = new Set(['DATABASE_URL', 'REDIS_URL', 'BUCKET_URL'])
-  const services = new Map() // base name -> { publicUrl, privateUrl }
-  for (const key of Object.keys(process.env)) {
-    if (skip.has(key) || key.endsWith('_BUCKET_URL')) continue
-    let m = key.match(/^(.+)_PRIVATE_URL$/)
-    if (m) {
-      services.set(m[1], { ...(services.get(m[1]) || {}), privateUrl: process.env[key] })
-      continue
-    }
-    m = key.match(/^(.+)_URL$/)
-    if (m) {
-      services.set(m[1], { ...(services.get(m[1]) || {}), publicUrl: process.env[key] })
-    }
-  }
-  if (services.size === 0) {
-    return [{ status: 'none', title: 'Connected services', detail: 'No *_URL env vars — connect this service to (or from) another service on the canvas, then redeploy.' }]
-  }
-  const results = []
-  for (const [name, urls] of services) {
-    for (const [label, url] of [['public', urls.publicUrl], ['private', urls.privateUrl]]) {
-      if (!url) continue
-      const started = Date.now()
-      try {
-        const res = await fetchWithTimeout(url, 4000)
-        const body = (await res.text()).slice(0, 200)
-        results.push({
-          status: 'ok',
-          title: `${name} (${label})`,
-          detail: `GET ${url} → ${res.status} in ${Date.now() - started}ms. Body preview: ${body.replace(/\s+/g, ' ').slice(0, 160)}`,
-        })
-      } catch (err) {
-        results.push({ status: 'error', title: `${name} (${label})`, detail: `GET ${url} failed: ${err.message}` })
-      }
-    }
-  }
-  return results
-}
-
-async function fetchWithTimeout(url, ms) {
-  const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), ms)
-  try {
-    return await fetch(url, { signal: controller.signal })
-  } finally {
-    clearTimeout(timer)
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Environment variables — proves the platform actually injected this service's
-// env (SSM Parameter Store / Secrets Manager → container). Set/rename/remove a
-// var in Monolayer, redeploy, and reload: it appears/updates/disappears here.
-// The disappear case is the important one — it proves the SSM backend's
-// delete-on-remove reconciliation, which a Secrets Manager blob got for free.
-//
-// Baseline container/runtime vars are hidden as noise, and any value whose NAME
-// looks like a credential is masked — this page is served on a PUBLIC ALB, so it
-// must never print a real DATABASE_URL/password. You still see the KEY exists and
-// its length, which is enough to confirm injection.
-// ---------------------------------------------------------------------------
-const HIDDEN_ENV = new Set(['PATH', 'HOME', 'HOSTNAME', 'PWD', 'SHLVL', 'TERM', 'NODE', 'NODE_VERSION', 'YARN_VERSION', 'NODE_ENV', 'INIT_CWD', 'CI', 'COLOR', 'EDITOR', 'AWS_EXECUTION_ENV', '_'])
-// Build/runtime injectors — Railpack/mise, npm, the ECS agent — flood the container with
-// dozens of vars that aren't yours (npm_config_*, MISE_*, ECS_*). Hide those prefixes so
-// the card shows what you actually SET plus connection-injected vars, which is the whole
-// point of this test tool. Heuristic: a different builder may introduce new noise prefixes.
-const HIDDEN_ENV_PREFIX = ['npm_', 'NPM_', 'MISE_', '__MISE', 'ECS_', 'AWS_CONTAINER_CREDENTIALS']
-const envHidden = (k) => HIDDEN_ENV.has(k) || HIDDEN_ENV_PREFIX.some((p) => k.startsWith(p))
-const SENSITIVE_ENV = /PASS|SECRET|TOKEN|CREDENTIAL|PRIVATE|_KEY$|^KEY|DATABASE_URL|REDIS_URL|CONNECTION|_URL$/i
-
-function envReport() {
-  const rows = Object.keys(process.env)
-    .filter((k) => !envHidden(k))
-    .sort()
-    .map((k) => {
-      const raw = process.env[k] ?? ''
-      return { name: k, value: SENSITIVE_ENV.test(k) ? `••••••• (set, ${raw.length} chars)` : raw }
-    })
-  return {
-    status: rows.length ? 'ok' : 'none',
-    title: `Environment variables (${rows.length})`,
-    detail: rows.length
-      ? 'Injected into this container by Monolayer. Set/rename/remove one, redeploy, and reload — a removed var must disappear here (delete-on-remove reconciliation). Credential-looking names are masked.'
-      : 'No environment variables set — add some in Monolayer, then redeploy.',
-    rows,
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Rendering. "/" is a static shell that fetches /api/status from the browser —
-// deliberately, for three reasons that all bit during demo prep:
-//   1. The shared ALB health-checks "/" with a 5s timeout every 15s; running the
-//      connection checks inline could exceed that and mark the target unhealthy
-//      (502s for the whole demo). The shell always answers in milliseconds.
-//   2. The health checker would otherwise INSERT a DB row / PUT an S3 object /
-//      append to the volume log every 15s, drowning the demo data in noise.
-//   3. Two demo apps connected to each other would recurse (A renders → GET B →
-//      B renders → GET A → …). Fetching "/" now returns instantly with no side
-//      effects; only a real browser triggers the checks.
-// The checks themselves still run SERVER-side (in /api/status) — that's the
-// point of the demo: the SERVICE reaches the DB/bucket/private URL, not the
-// viewer's browser.
-// ---------------------------------------------------------------------------
-const SHELL_HTML = `<!doctype html>
-<html>
+function layout({ title, body }) {
+  return `<!doctype html>
+<html lang="en">
 <head>
   <meta charset="utf-8" />
-  <title>Monolayer demo — ${HOSTNAME}</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>${title}</title>
   <style>
-    body { font-family: system-ui, sans-serif; max-width: 900px; margin: 2rem auto; padding: 0 1rem; background: #0b0f14; color: #e6edf3; }
-    h1 { font-size: 1.4rem; } h2 { font-size: 1.05rem; margin: 0 0 .4rem; }
-    .card { border: 1px solid #2a3038; border-radius: 8px; padding: 1rem 1.25rem; margin: 1rem 0; background: #11161c; }
-    .status-ok { border-left: 4px solid #3fb950; } .status-warn { border-left: 4px solid #d29922; }
-    .status-error { border-left: 4px solid #f85149; } .status-none { border-left: 4px solid #444c56; opacity: .75; }
-    table { border-collapse: collapse; margin-top: .5rem; font-size: .85rem; width: 100%; }
-    td { border-top: 1px solid #2a3038; padding: .3rem .5rem; }
-    code { background: #1c232b; padding: .1rem .3rem; border-radius: 4px; }
-    .meta { color: #8b949e; font-size: .85rem; }
+    :root {
+      --bg: #0f1419;
+      --panel: #171d25;
+      --line: #2a3340;
+      --text: #e8eef4;
+      --muted: #8b98a8;
+      --accent: #3d9cf0;
+      --ok: #3ecf8e;
+      --danger: #f07178;
+      --warn-bg: #2a2416;
+      --warn-line: #8a6d1f;
+      --warn-text: #f0d78c;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; min-height: 100vh;
+      font-family: "Segoe UI", ui-sans-serif, system-ui, sans-serif;
+      background:
+        radial-gradient(900px 420px at 10% -10%, #1a3a5c 0%, transparent 55%),
+        radial-gradient(700px 360px at 100% 0%, #1e2f24 0%, transparent 50%),
+        var(--bg);
+      color: var(--text);
+    }
+    .wrap { max-width: 720px; margin: 0 auto; padding: 2.5rem 1.25rem 3rem; }
+    h1 { font-size: 1.6rem; font-weight: 650; letter-spacing: -0.02em; margin: 0 0 .4rem; }
+    h2 { font-size: 1.05rem; margin: 0 0 .75rem; }
+    p { color: var(--muted); line-height: 1.5; }
+    .panel {
+      background: color-mix(in srgb, var(--panel) 92%, transparent);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 1.25rem 1.35rem;
+      margin-top: 1.25rem;
+      backdrop-filter: blur(8px);
+    }
+    .creds {
+      background: var(--warn-bg);
+      border: 1px solid var(--warn-line);
+      color: var(--warn-text);
+      border-radius: 12px;
+      padding: 1rem 1.1rem;
+      margin: 1.25rem 0;
+    }
+    .creds strong { color: #fff4c2; }
+    .creds code {
+      display: inline-block; background: #1a160c; color: #ffe8a3;
+      padding: .15rem .45rem; border-radius: 6px; font-size: .95rem;
+    }
+    .row { display: flex; gap: .75rem; flex-wrap: wrap; margin-top: .65rem; }
+    label { display: block; font-size: .85rem; color: var(--muted); margin: .85rem 0 .35rem; }
+    input {
+      width: 100%; padding: .7rem .8rem; border-radius: 10px;
+      border: 1px solid var(--line); background: #0c1016; color: var(--text);
+    }
+    input:focus { outline: 2px solid color-mix(in srgb, var(--accent) 55%, transparent); border-color: var(--accent); }
+    button, .btn {
+      display: inline-flex; align-items: center; justify-content: center;
+      border: 0; border-radius: 10px; padding: .7rem 1rem; cursor: pointer;
+      font-weight: 600; text-decoration: none; color: #041018; background: var(--accent);
+    }
+    button.ghost, a.ghost {
+      background: transparent; color: var(--text); border: 1px solid var(--line);
+    }
+    .error { color: var(--danger); font-size: .9rem; margin-top: .75rem; }
+    .grid { display: grid; gap: .85rem; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }
+    .stat {
+      border: 1px solid var(--line); border-radius: 12px; padding: .9rem 1rem; background: #121821;
+    }
+    .stat b { display: block; font-size: 1.25rem; margin-top: .25rem; }
+    .ok { color: var(--ok); }
+    .meta { font-size: .85rem; color: var(--muted); }
+    header.bar { display: flex; justify-content: space-between; align-items: center; gap: 1rem; }
   </style>
 </head>
 <body>
-  <h1>Monolayer connection demo</h1>
-  <p class="meta">Host <code>${HOSTNAME}</code> · reload after connecting/redeploying to see a section flip from ➖ to ✅.</p>
-  <div id="cards"><section class="card status-none"><p>Running connection checks…</p></section></div>
-  <script>
-    const BADGE = { ok: '✅', warn: '⚠️', error: '❌', none: '➖' }
-    function el(tag, cls, text) {
-      const n = document.createElement(tag)
-      if (cls) n.className = cls
-      if (text != null) n.textContent = text
-      return n
-    }
-    function card(item) {
-      const s = el('section', 'card status-' + item.status)
-      s.appendChild(el('h2', null, BADGE[item.status] + ' ' + item.title))
-      s.appendChild(el('p', null, item.detail))
-      if (item.rows && item.rows.length) {
-        const table = el('table'), tbody = el('tbody')
-        for (const r of item.rows) {
-          const tr = el('tr')
-          for (const v of Object.values(r)) tr.appendChild(el('td', null, String(v)))
-          tbody.appendChild(tr)
-        }
-        table.appendChild(tbody)
-        s.appendChild(table)
-      }
-      return s
-    }
-    fetch('/api/status').then((r) => r.json()).then((j) => {
-      const cards = document.getElementById('cards')
-      cards.replaceChildren()
-      for (const item of [j.env, j.database, ...j.buckets, j.volume, ...j.services]) cards.appendChild(card(item))
-    }).catch((err) => {
-      document.getElementById('cards').replaceChildren(card({ status: 'error', title: 'Status check', detail: String(err) }))
-    })
-  </script>
+  <div class="wrap">${body}</div>
 </body>
 </html>`
+}
+
+function loginPage(error) {
+  const accounts = USERS.map(
+    (u) =>
+      `<div class="row"><span><strong>${u.role}</strong> — username <code>${u.username}</code> · password <code>${u.password}</code></span></div>`,
+  ).join('')
+  return layout({
+    title: 'Sign in · Monolayer demo',
+    body: `
+      <h1>Monolayer demo app</h1>
+      <p>Hardcoded sign-in sample. Deploy this repo from the Monolayer canvas, open the service URL, then sign in with the credentials below.</p>
+      <div class="creds">
+        <strong>Demo login credentials</strong>
+        ${accounts}
+      </div>
+      <div class="panel">
+        <h2>Sign in</h2>
+        <form method="POST" action="/login">
+          <label for="username">Username</label>
+          <input id="username" name="username" autocomplete="username" required />
+          <label for="password">Password</label>
+          <input id="password" name="password" type="password" autocomplete="current-password" required />
+          ${error ? `<p class="error">${error}</p>` : ''}
+          <div class="row" style="margin-top:1.1rem">
+            <button type="submit">Sign in</button>
+          </div>
+        </form>
+      </div>
+      <p class="meta">Health check: <code>GET /</code> (login page) · App after login: <code>/app</code></p>
+    `,
+  })
+}
+
+function appPage(user) {
+  const now = new Date().toLocaleString()
+  return layout({
+    title: 'Home · Monolayer demo',
+    body: `
+      <header class="bar">
+        <div>
+          <h1>Welcome, ${user.name}</h1>
+          <p class="meta">Signed in as <code>${user.username}</code> · ${user.role}</p>
+        </div>
+        <form method="POST" action="/logout"><button class="ghost" type="submit">Sign out</button></form>
+      </header>
+      <div class="panel">
+        <h2>Your demo workspace</h2>
+        <p>This page is what you see after a successful login. Use it to confirm the Monolayer deploy is healthy end-to-end.</p>
+        <div class="grid" style="margin-top:1rem">
+          <div class="stat"><span class="meta">Status</span><b class="ok">Online</b></div>
+          <div class="stat"><span class="meta">Role</span><b>${user.role}</b></div>
+          <div class="stat"><span class="meta">Server time</span><b style="font-size:1rem">${now}</b></div>
+        </div>
+      </div>
+      <div class="panel">
+        <h2>Quick notes</h2>
+        <ul style="color:var(--muted);line-height:1.6;padding-left:1.1rem;margin:0">
+          <li>Auth is hardcoded in <code>server.js</code> — fine for demos, never for production.</li>
+          <li>Credentials stay visible on the login page so anyone can try the app.</li>
+          <li>Sessions are in-memory cookies; restarting the container signs everyone out.</li>
+        </ul>
+      </div>
+    `,
+  })
+}
 
 app.get('/', (req, res) => {
-  res.send(SHELL_HTML)
+  if (currentUser(req)) return res.redirect('/app')
+  res.type('html').send(loginPage())
 })
 
-app.get('/api/status', async (req, res) => {
-  const [db, buckets, volume, services] = await Promise.all([checkDatabase(), checkBuckets(), checkVolume(), checkServices()])
-  res.json({ hostname: HOSTNAME, env: envReport(), database: db, buckets, volume, services })
+app.post('/login', (req, res) => {
+  const username = String(req.body.username || '').trim()
+  const password = String(req.body.password || '')
+  const user = USERS.find((u) => u.username === username && u.password === password)
+  if (!user) return res.status(401).type('html').send(loginPage('Invalid username or password.'))
+  setSession(res, user.username)
+  res.redirect('/app')
+})
+
+app.get('/app', (req, res) => {
+  const user = currentUser(req)
+  if (!user) return res.redirect('/')
+  res.type('html').send(appPage(user))
+})
+
+app.post('/logout', (req, res) => {
+  clearSession(res, req)
+  res.redirect('/')
+})
+
+app.get('/healthz', (_req, res) => {
+  res.json({ ok: true })
 })
 
 app.listen(PORT, '0.0.0.0', () => {
