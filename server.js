@@ -5,7 +5,7 @@
 const crypto = require('crypto')
 const express = require('express')
 const { BedrockRuntimeClient } = require('@aws-sdk/client-bedrock-runtime')
-const { createBedrockResponder } = require('./bedrock')
+const { bedrockFailure, createBedrockResponder } = require('./bedrock')
 
 const PORT = Number(process.env.PORT) || 3000
 const COOKIE = 'ml_demo_session'
@@ -412,9 +412,22 @@ app.post('/api/bedrock/chat', (req, res, next) => {
   respondWithBedrock(messages).then((reply) => {
     res.json({ reply })
   }).catch((err) => {
-    console.error('Bedrock chat request failed:', err)
+    const failure = bedrockFailure(err)
+    console.error(JSON.stringify({
+      event: 'bedrock_chat_failed',
+      code: failure.code,
+      requestId: failure.requestId,
+      httpStatusCode: err?.$metadata?.httpStatusCode,
+      modelId: BEDROCK_MODEL_ID,
+      region: BEDROCK_REGION,
+      message: err?.message,
+    }))
     if (res.headersSent) return next(err)
-    res.status(502).json({ error: 'The Bedrock model request failed. Check model access and the connected AWS role, then retry.' })
+    res.status(502).json({
+      error: failure.message,
+      code: failure.code,
+      ...(failure.requestId ? { requestId: failure.requestId } : {}),
+    })
   })
 })
 

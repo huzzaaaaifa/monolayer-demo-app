@@ -1,7 +1,23 @@
 const test = require('node:test')
 const assert = require('node:assert/strict')
 const { ConverseCommand } = require('@aws-sdk/client-bedrock-runtime')
-const { createBedrockResponder } = require('./bedrock')
+const { bedrockFailure, createBedrockResponder } = require('./bedrock')
+
+test('maps AWS errors to safe actionable explanations', () => {
+  const accessDenied = bedrockFailure({
+    name: 'AccessDeniedException',
+    message: 'Sensitive AWS detail',
+    $metadata: { requestId: 'request-123' },
+  })
+
+  assert.equal(accessDenied.code, 'AccessDeniedException')
+  assert.equal(accessDenied.requestId, 'request-123')
+  assert.match(accessDenied.message, /runtime role allows bedrock:InvokeModel/)
+  assert.doesNotMatch(accessDenied.message, /Sensitive AWS detail/)
+
+  const invalidModel = bedrockFailure({ name: 'ValidationException' })
+  assert.match(invalidModel.message, /Converse API|inference profile/)
+})
 
 test('sends chat history to the configured model and returns its text response', async () => {
   let command

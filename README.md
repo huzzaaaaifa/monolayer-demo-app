@@ -84,6 +84,8 @@ Railpack builds the Node app from the repo; a Dockerfile is optional for this pa
 2. Connect that AI Model to this demo service and deploy/redeploy the service.
 3. Sign in and send a message in **Bedrock chat**. A model response verifies that the injected model settings and the service's AWS IAM role can invoke Bedrock.
 
+If a request fails, the chat reports common permission, model, and region issues. For an unclassified AWS error, check the service's runtime logs for `bedrock_chat_failed`; they include the AWS error code and request ID, but never the chat prompt. Share the error code/request ID when troubleshooting.
+
 Bedrock does **not** use an API key here. Canvas injects `AI_PROVIDER`, `AI_MODEL_ID`, `BEDROCK_MODEL_ID`, and `BEDROCK_REGION`; the AWS SDK obtains temporary credentials from the service's runtime IAM role. Do not put AWS access keys or secrets in the browser or `.env`.
 
 Each chat request uses AWS Bedrock and is billed to your AWS account according to the selected model's current input/output token rates. The demo does not estimate a fixed monthly AI cost.
