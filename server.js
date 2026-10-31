@@ -4,10 +4,23 @@
  */
 const crypto = require('crypto')
 const express = require('express')
+const { BedrockRuntimeClient } = require('@aws-sdk/client-bedrock-runtime')
+const { createBedrockResponder } = require('./bedrock')
 
 const PORT = Number(process.env.PORT) || 3000
 const COOKIE = 'ml_demo_session'
 const SECRET = process.env.SESSION_SECRET || 'monolayer-demo-not-secret'
+const BEDROCK_MODEL_ID = process.env.BEDROCK_MODEL_ID || process.env.AI_MODEL_ID || ''
+const BEDROCK_REGION = process.env.BEDROCK_REGION || ''
+const bedrockConfigured =
+  process.env.AI_PROVIDER === 'bedrock' && Boolean(BEDROCK_MODEL_ID && BEDROCK_REGION)
+const bedrockClient = bedrockConfigured
+  ? new BedrockRuntimeClient({ region: BEDROCK_REGION, maxAttempts: 2 })
+  : null
+const respondWithBedrock = bedrockClient
+  ? createBedrockResponder(bedrockClient, BEDROCK_MODEL_ID)
+  : null
+const chatRequests = new Map()
 
 /** Demo accounts — also printed on the login UI. */
 const USERS = [
@@ -19,7 +32,19 @@ const sessions = new Map() // id -> username
 
 const app = express()
 app.use(express.urlencoded({ extended: false }))
-app.use(express.json())
+const jsonParser = express.json({ limit: '80kb' })
+app.use((req, res, next) => {
+  jsonParser(req, res, (err) => {
+    if (!err) return next()
+    if (err.type === 'entity.too.large') {
+      return res.status(413).json({ error: 'Request body is too large.' })
+    }
+    if (req.path.startsWith('/api/') && err.type === 'entity.parse.failed') {
+      return res.status(400).json({ error: 'Request body must be valid JSON.' })
+    }
+    return next(err)
+  })
+})
 
 function sign(value) {
   return crypto.createHmac('sha256', SECRET).update(value).digest('hex').slice(0, 24)
@@ -143,6 +168,22 @@ function layout({ title, body }) {
     .stat {
       border: 1px solid var(--line); border-radius: 12px; padding: .9rem 1rem; background: #121821;
     }
+    .chat { display: grid; gap: .75rem; }
+    .chat-log {
+      display: grid; gap: .7rem; max-height: 360px; overflow-y: auto;
+      border: 1px solid var(--line); border-radius: 12px; padding: .85rem; background: #10161e;
+    }
+    .message { max-width: 90%; padding: .65rem .8rem; border-radius: 10px; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .message.user { justify-self: end; background: #17314a; color: var(--text); }
+    .message.assistant { justify-self: start; background: #202a35; color: var(--text); }
+    .chat textarea {
+      width: 100%; min-height: 82px; resize: vertical; padding: .7rem .8rem;
+      border-radius: 10px; border: 1px solid var(--line); background: #0c1016; color: var(--text);
+      font: inherit;
+    }
+    .chat textarea:focus { outline: 2px solid color-mix(in srgb, var(--accent) 55%, transparent); border-color: var(--accent); }
+    .chat button:disabled { opacity: .55; cursor: wait; }
+    .chat-status { min-height: 1.25rem; margin: 0; font-size: .9rem; }
     .stat b { display: block; font-size: 1.25rem; margin-top: .25rem; }
     .ok { color: var(--ok); }
     .meta { font-size: .85rem; color: var(--muted); }
@@ -209,6 +250,23 @@ function appPage(user) {
         </div>
       </div>
       <div class="panel">
+        <h2>Bedrock chat</h2>
+        <p id="bedrock-status" class="meta">Checking the connected AI Model…</p>
+        <p class="meta">Model usage is billed by AWS based on its current token rates.</p>
+        <div class="chat">
+          <div id="chat-log" class="chat-log" aria-live="polite" aria-label="Chat conversation"></div>
+          <form id="chat-form">
+            <label for="chat-message">Message</label>
+            <textarea id="chat-message" maxlength="2000" required placeholder="Ask a question to verify the connected Bedrock model"></textarea>
+            <div class="row">
+              <button id="chat-submit" type="submit" disabled>Send</button>
+              <button id="chat-clear" class="ghost" type="button" disabled>Clear chat</button>
+            </div>
+          </form>
+          <p id="chat-error" class="chat-status error" role="status"></p>
+        </div>
+      </div>
+      <div class="panel">
         <h2>Quick notes</h2>
         <ul style="color:var(--muted);line-height:1.6;padding-left:1.1rem;margin:0">
           <li>Auth is hardcoded in <code>server.js</code> — fine for demos, never for production.</li>
@@ -216,6 +274,79 @@ function appPage(user) {
           <li>Sessions are in-memory cookies; restarting the container signs everyone out.</li>
         </ul>
       </div>
+      <script>
+        (() => {
+          const log = document.getElementById('chat-log')
+          const status = document.getElementById('bedrock-status')
+          const error = document.getElementById('chat-error')
+          const form = document.getElementById('chat-form')
+          const input = document.getElementById('chat-message')
+          const submit = document.getElementById('chat-submit')
+          const clear = document.getElementById('chat-clear')
+          const messages = []
+          let busy = false
+          let modelReady = false
+          const render = () => {
+            log.replaceChildren(...messages.map((message) => {
+              const bubble = document.createElement('div')
+              bubble.className = 'message ' + message.role
+              bubble.textContent = message.content
+              return bubble
+            }))
+            log.scrollTop = log.scrollHeight
+            clear.disabled = busy || messages.length === 0
+          }
+          fetch('/api/bedrock/status')
+            .then(async (response) => {
+              const data = await response.json()
+              if (!response.ok) throw new Error(data.error || 'Could not check the AI Model connection.')
+              if (!data.configured) {
+                status.textContent = 'Connect an Amazon Bedrock AI Model to this service in Canvas, then redeploy.'
+                return
+              }
+              status.textContent = 'Bedrock model connected (' + data.region + '). Send a message to test it.'
+              modelReady = true
+              submit.disabled = false
+            })
+            .catch((cause) => { status.textContent = cause.message })
+          form.addEventListener('submit', async (event) => {
+            event.preventDefault()
+            const content = input.value.trim()
+            if (!content || busy) return
+            error.textContent = ''
+            if (messages.length >= 12) messages.splice(0, 2)
+            messages.push({ role: 'user', content })
+            input.value = ''
+            busy = true
+            submit.disabled = true
+            render()
+            try {
+              const response = await fetch('/api/bedrock/chat', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ messages: messages.slice(-12) }),
+              })
+              const data = await response.json()
+              if (!response.ok) throw new Error(data.error || 'The Bedrock request failed.')
+              messages.push({ role: 'assistant', content: data.reply })
+              if (messages.length > 12) messages.splice(0, messages.length - 12)
+            } catch (cause) {
+              messages.pop()
+              input.value = content
+              error.textContent = cause.message
+            } finally {
+              busy = false
+              submit.disabled = !modelReady
+              render()
+            }
+          })
+          clear.addEventListener('click', () => {
+            messages.length = 0
+            error.textContent = ''
+            render()
+          })
+        })()
+      </script>
     `,
   })
 }
@@ -243,6 +374,48 @@ app.get('/app', (req, res) => {
 app.post('/logout', (req, res) => {
   clearSession(res, req)
   res.redirect('/')
+})
+
+app.get('/api/bedrock/status', (req, res) => {
+  if (!currentUser(req)) return res.status(401).json({ error: 'Sign in to check the model connection.' })
+  res.json({ configured: bedrockConfigured, ...(bedrockConfigured ? { region: BEDROCK_REGION } : {}) })
+})
+
+app.post('/api/bedrock/chat', (req, res, next) => {
+  const user = currentUser(req)
+  if (!user) return res.status(401).json({ error: 'Sign in to use the chat.' })
+  if (!bedrockConfigured || !respondWithBedrock) {
+    return res.status(503).json({ error: 'Connect an Amazon Bedrock AI Model to this service in Canvas, then redeploy.' })
+  }
+
+  const now = Date.now()
+  const messages = req.body?.messages
+  if (!Array.isArray(messages) || messages.length < 1 || messages.length > 12) {
+    return res.status(400).json({ error: 'Send between 1 and 12 recent chat messages.' })
+  }
+  const valid = messages.every((message, index) => {
+    const expectedRole = index % 2 === 0 ? 'user' : 'assistant'
+    return message && message.role === expectedRole &&
+      typeof message.content === 'string' &&
+      message.content.trim().length > 0 &&
+      message.content.length <= 2000
+  })
+  if (!valid || messages[messages.length - 1].role !== 'user') {
+    return res.status(400).json({ error: 'Messages must alternate between user and assistant and end with your message.' })
+  }
+
+  const recent = (chatRequests.get(user.username) || []).filter((time) => now - time < 60_000)
+  if (recent.length >= 15) return res.status(429).json({ error: 'Chat limit reached. Try again in a minute.' })
+  recent.push(now)
+  chatRequests.set(user.username, recent)
+
+  respondWithBedrock(messages).then((reply) => {
+    res.json({ reply })
+  }).catch((err) => {
+    console.error('Bedrock chat request failed:', err)
+    if (res.headersSent) return next(err)
+    res.status(502).json({ error: 'The Bedrock model request failed. Check model access and the connected AWS role, then retry.' })
+  })
 })
 
 app.get('/healthz', (_req, res) => {

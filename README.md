@@ -1,10 +1,10 @@
 # Monolayer demo app
 
-A tiny  web app for trying Monolayer Canvas end-to-end.
+A tiny web app for trying Monolayer Canvas end-to-end, including a real Amazon Bedrock chat request.
 
 - Login page shows the demo credentials
 - After sign-in you land on a simple home screen
-- No database, no AWS SDKs — Node + Express only
+- No database; Bedrock requests use the deployed service's AWS IAM role
 
 ## Demo credentials
 
@@ -16,6 +16,8 @@ A tiny  web app for trying Monolayer Canvas end-to-end.
 These are also printed on the login page UI.
 
 ## Run locally
+
+Node.js 20 or newer is required for the AWS SDK.
 
 ```bash
 npm install
@@ -73,7 +75,18 @@ Railpack builds the Node app from the repo; a Dockerfile is optional for this pa
 
 1. **Login page** with the yellow credentials box (`demo` / `demo123`, `admin` / `admin123`)
 2. After sign-in → **Welcome** home with Online status, role, and server time
-3. **Sign out** returns you to the login page
+3. **Bedrock chat** responds when an Amazon Bedrock AI Model is connected to this service
+4. **Sign out** returns you to the login page
+
+### Connect a Bedrock model
+
+1. Add an **AI Model** resource in Canvas and choose Amazon Bedrock and a model available to your connected AWS account.
+2. Connect that AI Model to this demo service and deploy/redeploy the service.
+3. Sign in and send a message in **Bedrock chat**. A model response verifies that the injected model settings and the service's AWS IAM role can invoke Bedrock.
+
+Bedrock does **not** use an API key here. Canvas injects `AI_PROVIDER`, `AI_MODEL_ID`, `BEDROCK_MODEL_ID`, and `BEDROCK_REGION`; the AWS SDK obtains temporary credentials from the service's runtime IAM role. Do not put AWS access keys or secrets in the browser or `.env`.
+
+Each chat request uses AWS Bedrock and is billed to your AWS account according to the selected model's current input/output token rates. The demo does not estimate a fixed monthly AI cost.
 
 ### Health checks
 
