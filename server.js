@@ -1,38 +1,26 @@
 /**
- * Monolayer Canvas demo — hardcoded sign-in only.
- * Credentials are shown on the login page on purpose (demo, not production).
+ * Monolayer Canvas demo — public chat using the connected OpenRouter AI Model.
  */
-const crypto = require('crypto')
 const express = require('express')
-const { BedrockRuntimeClient } = require('@aws-sdk/client-bedrock-runtime')
-const { bedrockFailure, createBedrockResponder } = require('./bedrock')
+const { createOpenRouterResponder, openRouterFailure } = require('./openrouter')
 
 const PORT = Number(process.env.PORT) || 3000
-const COOKIE = 'ml_demo_session'
-const SECRET = process.env.SESSION_SECRET || 'monolayer-demo-not-secret'
-const BEDROCK_MODEL_ID = process.env.BEDROCK_MODEL_ID || process.env.AI_MODEL_ID || ''
-const BEDROCK_REGION = process.env.BEDROCK_REGION || ''
-const bedrockConfigured =
-  process.env.AI_PROVIDER === 'bedrock' && Boolean(BEDROCK_MODEL_ID && BEDROCK_REGION)
-const bedrockClient = bedrockConfigured
-  ? new BedrockRuntimeClient({ region: BEDROCK_REGION, maxAttempts: 2 })
+const MODEL_ID = process.env.OPENROUTER_MODEL || process.env.AI_MODEL_ID || ''
+const API_KEY = process.env.OPENROUTER_API_KEY || ''
+const configured = process.env.AI_PROVIDER === 'openrouter' && Boolean(MODEL_ID && API_KEY)
+const respondWithOpenRouter = configured
+  ? createOpenRouterResponder({ apiKey: API_KEY, modelId: MODEL_ID })
   : null
-const respondWithBedrock = bedrockClient
-  ? createBedrockResponder(bedrockClient, BEDROCK_MODEL_ID)
-  : null
-const chatRequests = new Map()
-
-/** Demo accounts — also printed on the login UI. */
-const USERS = [
-  { username: 'demo', password: 'demo123', name: 'Demo User', role: 'Member' },
-  { username: 'admin', password: 'admin123', name: 'Admin User', role: 'Admin' },
-]
-
-const sessions = new Map() // id -> username
+const clientRequests = new Map()
+const globalRequests = []
+const CLIENT_REQUEST_LIMIT = 10
+const GLOBAL_REQUEST_LIMIT = 120
+const RATE_WINDOW_MS = 60_000
+const MAX_TRACKED_CLIENTS = 10_000
 
 const app = express()
-app.use(express.urlencoded({ extended: false }))
-const jsonParser = express.json({ limit: '80kb' })
+const jsonParser = express.json({ limit: '32kb' })
+app.disable('x-powered-by')
 app.use((req, res, next) => {
   jsonParser(req, res, (err) => {
     if (!err) return next()
@@ -46,72 +34,50 @@ app.use((req, res, next) => {
   })
 })
 
-function sign(value) {
-  return crypto.createHmac('sha256', SECRET).update(value).digest('hex').slice(0, 24)
-}
-
-function setSession(res, username) {
-  const id = crypto.randomBytes(16).toString('hex')
-  sessions.set(id, username)
-  const token = `${id}.${sign(id)}`
-  res.setHeader(
-    'Set-Cookie',
-    `${COOKIE}=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${60 * 60 * 8}`,
+function checkRateLimit(clientKey, now = Date.now()) {
+  while (globalRequests.length && now - globalRequests[0] >= RATE_WINDOW_MS) {
+    globalRequests.shift()
+  }
+  const recent = (clientRequests.get(clientKey) || []).filter(
+    (timestamp) => now - timestamp < RATE_WINDOW_MS,
   )
-}
-
-function clearSession(res, req) {
-  const user = currentUser(req)
-  const raw = parseCookie(req)[COOKIE]
-  if (raw) {
-    const id = raw.split('.')[0]
-    sessions.delete(id)
+  if (recent.length === 0 && !clientRequests.has(clientKey) &&
+      clientRequests.size >= MAX_TRACKED_CLIENTS) {
+    for (const [key, timestamps] of clientRequests) {
+      if (!timestamps.some((timestamp) => now - timestamp < RATE_WINDOW_MS)) {
+        clientRequests.delete(key)
+      }
+    }
+    if (clientRequests.size >= MAX_TRACKED_CLIENTS) return 'capacity'
   }
-  res.setHeader('Set-Cookie', `${COOKIE}=; Path=/; HttpOnly; Max-Age=0`)
-  return user
-}
-
-function parseCookie(req) {
-  const out = {}
-  const header = req.headers.cookie || ''
-  for (const part of header.split(';')) {
-    const i = part.indexOf('=')
-    if (i === -1) continue
-    out[part.slice(0, i).trim()] = decodeURIComponent(part.slice(i + 1).trim())
+  if (recent.length >= CLIENT_REQUEST_LIMIT || globalRequests.length >= GLOBAL_REQUEST_LIMIT) {
+    clientRequests.set(clientKey, recent)
+    return 'limited'
   }
-  return out
+  recent.push(now)
+  clientRequests.set(clientKey, recent)
+  globalRequests.push(now)
+  return 'allowed'
 }
 
-function currentUser(req) {
-  const raw = parseCookie(req)[COOKIE]
-  if (!raw) return null
-  const [id, sig] = raw.split('.')
-  if (!id || !sig || sign(id) !== sig) return null
-  const username = sessions.get(id)
-  if (!username) return null
-  return USERS.find((u) => u.username === username) || null
-}
-
-function layout({ title, body }) {
+function layout(body) {
   return `<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>${title}</title>
+  <meta name="referrer" content="same-origin" />
+  <title>OpenRouter chat · Monolayer demo</title>
   <style>
     :root {
+      color-scheme: dark;
       --bg: #0f1419;
       --panel: #171d25;
       --line: #2a3340;
       --text: #e8eef4;
       --muted: #8b98a8;
       --accent: #3d9cf0;
-      --ok: #3ecf8e;
       --danger: #f07178;
-      --warn-bg: #2a2416;
-      --warn-line: #8a6d1f;
-      --warn-text: #f0d78c;
     }
     * { box-sizing: border-box; }
     body {
@@ -123,7 +89,7 @@ function layout({ title, body }) {
         var(--bg);
       color: var(--text);
     }
-    .wrap { max-width: 720px; margin: 0 auto; padding: 2.5rem 1.25rem 3rem; }
+    .wrap { max-width: 760px; margin: 0 auto; padding: 2.5rem 1.25rem 3rem; }
     h1 { font-size: 1.6rem; font-weight: 650; letter-spacing: -0.02em; margin: 0 0 .4rem; }
     h2 { font-size: 1.05rem; margin: 0 0 .75rem; }
     p { color: var(--muted); line-height: 1.5; }
@@ -135,260 +101,167 @@ function layout({ title, body }) {
       margin-top: 1.25rem;
       backdrop-filter: blur(8px);
     }
-    .creds {
-      background: var(--warn-bg);
-      border: 1px solid var(--warn-line);
-      color: var(--warn-text);
-      border-radius: 12px;
-      padding: 1rem 1.1rem;
-      margin: 1.25rem 0;
-    }
-    .creds strong { color: #fff4c2; }
-    .creds code {
-      display: inline-block; background: #1a160c; color: #ffe8a3;
-      padding: .15rem .45rem; border-radius: 6px; font-size: .95rem;
-    }
-    .row { display: flex; gap: .75rem; flex-wrap: wrap; margin-top: .65rem; }
-    label { display: block; font-size: .85rem; color: var(--muted); margin: .85rem 0 .35rem; }
-    input {
-      width: 100%; padding: .7rem .8rem; border-radius: 10px;
-      border: 1px solid var(--line); background: #0c1016; color: var(--text);
-    }
-    input:focus { outline: 2px solid color-mix(in srgb, var(--accent) 55%, transparent); border-color: var(--accent); }
-    button, .btn {
-      display: inline-flex; align-items: center; justify-content: center;
-      border: 0; border-radius: 10px; padding: .7rem 1rem; cursor: pointer;
-      font-weight: 600; text-decoration: none; color: #041018; background: var(--accent);
-    }
-    button.ghost, a.ghost {
-      background: transparent; color: var(--text); border: 1px solid var(--line);
-    }
-    .error { color: var(--danger); font-size: .9rem; margin-top: .75rem; }
-    .grid { display: grid; gap: .85rem; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }
-    .stat {
-      border: 1px solid var(--line); border-radius: 12px; padding: .9rem 1rem; background: #121821;
-    }
+    .meta { font-size: .85rem; color: var(--muted); }
     .chat { display: grid; gap: .75rem; }
     .chat-log {
-      display: grid; gap: .7rem; max-height: 360px; overflow-y: auto;
+      display: grid; gap: .7rem; min-height: 120px; max-height: 460px; overflow-y: auto;
       border: 1px solid var(--line); border-radius: 12px; padding: .85rem; background: #10161e;
     }
-    .message { max-width: 90%; padding: .65rem .8rem; border-radius: 10px; white-space: pre-wrap; overflow-wrap: anywhere; }
-    .message.user { justify-self: end; background: #17314a; color: var(--text); }
-    .message.assistant { justify-self: start; background: #202a35; color: var(--text); }
-    .chat textarea {
-      width: 100%; min-height: 82px; resize: vertical; padding: .7rem .8rem;
-      border-radius: 10px; border: 1px solid var(--line); background: #0c1016; color: var(--text);
-      font: inherit;
+    .message {
+      max-width: 90%; padding: .65rem .8rem; border-radius: 10px;
+      white-space: pre-wrap; overflow-wrap: anywhere;
     }
-    .chat textarea:focus { outline: 2px solid color-mix(in srgb, var(--accent) 55%, transparent); border-color: var(--accent); }
-    .chat button:disabled { opacity: .55; cursor: wait; }
+    .message.user { justify-self: end; background: #17314a; }
+    .message.assistant { justify-self: start; background: #202a35; }
+    label { display: block; font-size: .85rem; color: var(--muted); margin: .85rem 0 .35rem; }
+    textarea {
+      width: 100%; min-height: 82px; resize: vertical; padding: .7rem .8rem;
+      border-radius: 10px; border: 1px solid var(--line); background: #0c1016;
+      color: var(--text); font: inherit;
+    }
+    textarea:focus { outline: 2px solid color-mix(in srgb, var(--accent) 55%, transparent); border-color: var(--accent); }
+    .row { display: flex; gap: .75rem; flex-wrap: wrap; margin-top: .65rem; }
+    button {
+      display: inline-flex; align-items: center; justify-content: center;
+      border: 0; border-radius: 10px; padding: .7rem 1rem; cursor: pointer;
+      font-weight: 600; color: #041018; background: var(--accent);
+    }
+    button.ghost { background: transparent; color: var(--text); border: 1px solid var(--line); }
+    button:disabled { opacity: .55; cursor: not-allowed; }
+    .error { color: var(--danger); }
     .chat-status { min-height: 1.25rem; margin: 0; font-size: .9rem; }
-    .stat b { display: block; font-size: 1.25rem; margin-top: .25rem; }
-    .ok { color: var(--ok); }
-    .meta { font-size: .85rem; color: var(--muted); }
-    header.bar { display: flex; justify-content: space-between; align-items: center; gap: 1rem; }
   </style>
 </head>
-<body>
-  <div class="wrap">${body}</div>
-</body>
+<body><main class="wrap">${body}</main></body>
 </html>`
 }
 
-function loginPage(error) {
-  const accounts = USERS.map(
-    (u) =>
-      `<div class="row"><span><strong>${u.role}</strong> — username <code>${u.username}</code> · password <code>${u.password}</code></span></div>`,
-  ).join('')
-  return layout({
-    title: 'Sign in · Monolayer demo',
-    body: `
-      <h1>Monolayer demo app</h1>
-      <p>Hardcoded sign-in sample. Deploy this repo from the Monolayer canvas, open the service URL, then sign in with the credentials below.</p>
-      <div class="creds">
-        <strong>Demo login credentials</strong>
-        ${accounts}
-      </div>
-      <div class="panel">
-        <h2>Sign in</h2>
-        <form method="POST" action="/login">
-          <label for="username">Username</label>
-          <input id="username" name="username" autocomplete="username" required />
-          <label for="password">Password</label>
-          <input id="password" name="password" type="password" autocomplete="current-password" required />
-          ${error ? `<p class="error">${error}</p>` : ''}
-          <div class="row" style="margin-top:1.1rem">
-            <button type="submit">Sign in</button>
+function chatPage() {
+  return layout(`
+    <h1>Monolayer demo chat</h1>
+    <p>Try the OpenRouter AI Model connected to this service in Canvas.</p>
+    <section class="panel">
+      <h2 id="model-title">OpenRouter chat</h2>
+      <p id="model-status" class="meta">Checking the connected AI Model…</p>
+      <p class="meta">Model usage is billed by OpenRouter based on its current rates.</p>
+      <div class="chat">
+        <div id="chat-log" class="chat-log" aria-live="polite" aria-label="Chat conversation"></div>
+        <form id="chat-form">
+          <label for="chat-message">Message</label>
+          <textarea id="chat-message" maxlength="2000" required
+            placeholder="Ask a question to test the connected OpenRouter model"></textarea>
+          <div class="row">
+            <button id="chat-submit" type="submit" disabled>Send</button>
+            <button id="chat-clear" class="ghost" type="button" disabled>Clear chat</button>
           </div>
         </form>
+        <p id="chat-error" class="chat-status error" role="status"></p>
       </div>
-      <p class="meta">Health check: <code>GET /</code> (login page) · App after login: <code>/app</code></p>
-    `,
-  })
-}
-
-function appPage(user) {
-  const now = new Date().toLocaleString()
-  return layout({
-    title: 'Home · Monolayer demo',
-    body: `
-      <header class="bar">
-        <div>
-          <h1>Welcome, ${user.name}</h1>
-          <p class="meta">Signed in as <code>${user.username}</code> · ${user.role}</p>
-        </div>
-        <form method="POST" action="/logout"><button class="ghost" type="submit">Sign out</button></form>
-      </header>
-      <div class="panel">
-        <h2>Your demo workspace</h2>
-        <p>This page is what you see after a successful login. Use it to confirm the Monolayer deploy is healthy end-to-end.</p>
-        <div class="grid" style="margin-top:1rem">
-          <div class="stat"><span class="meta">Status</span><b class="ok">Online</b></div>
-          <div class="stat"><span class="meta">Role</span><b>${user.role}</b></div>
-          <div class="stat"><span class="meta">Server time</span><b style="font-size:1rem">${now}</b></div>
-        </div>
-      </div>
-      <div class="panel">
-        <h2>Bedrock chat</h2>
-        <p id="bedrock-status" class="meta">Checking the connected AI Model…</p>
-        <p class="meta">Model usage is billed by AWS based on its current token rates.</p>
-        <div class="chat">
-          <div id="chat-log" class="chat-log" aria-live="polite" aria-label="Chat conversation"></div>
-          <form id="chat-form">
-            <label for="chat-message">Message</label>
-            <textarea id="chat-message" maxlength="2000" required placeholder="Ask a question to verify the connected Bedrock model"></textarea>
-            <div class="row">
-              <button id="chat-submit" type="submit" disabled>Send</button>
-              <button id="chat-clear" class="ghost" type="button" disabled>Clear chat</button>
-            </div>
-          </form>
-          <p id="chat-error" class="chat-status error" role="status"></p>
-        </div>
-      </div>
-      <div class="panel">
-        <h2>Quick notes</h2>
-        <ul style="color:var(--muted);line-height:1.6;padding-left:1.1rem;margin:0">
-          <li>Auth is hardcoded in <code>server.js</code> — fine for demos, never for production.</li>
-          <li>Credentials stay visible on the login page so anyone can try the app.</li>
-          <li>Sessions are in-memory cookies; restarting the container signs everyone out.</li>
-        </ul>
-      </div>
-      <script>
-        (() => {
-          const log = document.getElementById('chat-log')
-          const status = document.getElementById('bedrock-status')
-          const error = document.getElementById('chat-error')
-          const form = document.getElementById('chat-form')
-          const input = document.getElementById('chat-message')
-          const submit = document.getElementById('chat-submit')
-          const clear = document.getElementById('chat-clear')
-          const messages = []
-          let busy = false
-          let modelReady = false
-          const render = () => {
-            log.replaceChildren(...messages.map((message) => {
-              const bubble = document.createElement('div')
-              bubble.className = 'message ' + message.role
-              bubble.textContent = message.content
-              return bubble
-            }))
-            log.scrollTop = log.scrollHeight
-            clear.disabled = busy || messages.length === 0
-          }
-          fetch('/api/bedrock/status')
-            .then(async (response) => {
-              const data = await response.json()
-              if (!response.ok) throw new Error(data.error || 'Could not check the AI Model connection.')
-              if (!data.configured) {
-                status.textContent = 'Connect an Amazon Bedrock AI Model to this service in Canvas, then redeploy.'
-                return
-              }
-              status.textContent = 'Bedrock model connected (' + data.region + '). Send a message to test it.'
-              modelReady = true
-              submit.disabled = false
-            })
-            .catch((cause) => { status.textContent = cause.message })
-          form.addEventListener('submit', async (event) => {
-            event.preventDefault()
-            const content = input.value.trim()
-            if (!content || busy) return
-            error.textContent = ''
-            if (messages.length >= 12) messages.splice(0, 2)
-            messages.push({ role: 'user', content })
-            input.value = ''
-            busy = true
-            submit.disabled = true
-            render()
-            try {
-              const response = await fetch('/api/bedrock/chat', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ messages: messages.slice(-12) }),
-              })
-              const data = await response.json()
-              if (!response.ok) throw new Error(data.error || 'The Bedrock request failed.')
-              messages.push({ role: 'assistant', content: data.reply })
-              if (messages.length > 12) messages.splice(0, messages.length - 12)
-            } catch (cause) {
-              messages.pop()
-              input.value = content
-              error.textContent = cause.message
-            } finally {
-              busy = false
-              submit.disabled = !modelReady
-              render()
+    </section>
+    <script>
+      (() => {
+        const log = document.getElementById('chat-log')
+        const status = document.getElementById('model-status')
+        const title = document.getElementById('model-title')
+        const error = document.getElementById('chat-error')
+        const form = document.getElementById('chat-form')
+        const input = document.getElementById('chat-message')
+        const submit = document.getElementById('chat-submit')
+        const clear = document.getElementById('chat-clear')
+        const messages = []
+        let busy = false
+        let modelReady = false
+        const render = () => {
+          log.replaceChildren(...messages.map((message) => {
+            const bubble = document.createElement('div')
+            bubble.className = 'message ' + message.role
+            bubble.textContent = message.content
+            return bubble
+          }))
+          log.scrollTop = log.scrollHeight
+          clear.disabled = busy || messages.length === 0
+        }
+        fetch('/api/openrouter/status')
+          .then(async (response) => {
+            const data = await response.json()
+            if (!response.ok) throw new Error(data.error || 'Could not check the model connection.')
+            if (!data.configured) {
+              status.textContent = 'Connect an OpenRouter AI Model to this service in Canvas, then redeploy.'
+              return
             }
+            title.textContent = data.model
+            status.textContent = 'Connected to OpenRouter. Send a message to test the model.'
+            modelReady = true
+            submit.disabled = false
           })
-          clear.addEventListener('click', () => {
-            messages.length = 0
-            error.textContent = ''
+          .catch((cause) => { status.textContent = cause.message })
+        form.addEventListener('submit', async (event) => {
+          event.preventDefault()
+          const content = input.value.trim()
+          if (!content || busy || !modelReady) return
+          error.textContent = ''
+          if (messages.length >= 12) messages.splice(0, 2)
+          messages.push({ role: 'user', content })
+          input.value = ''
+          busy = true
+          submit.disabled = true
+          render()
+          try {
+            const response = await fetch('/api/openrouter/chat', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ messages: messages.slice(-12) }),
+            })
+            const data = await response.json()
+            if (!response.ok) throw new Error(data.error || 'The OpenRouter request failed.')
+            messages.push({ role: 'assistant', content: data.reply })
+            if (messages.length > 12) messages.splice(0, messages.length - 12)
+          } catch (cause) {
+            messages.pop()
+            input.value = content
+            error.textContent = cause.message
+          } finally {
+            busy = false
+            submit.disabled = !modelReady
             render()
-          })
-        })()
-      </script>
-    `,
-  })
+          }
+        })
+        clear.addEventListener('click', () => {
+          messages.length = 0
+          error.textContent = ''
+          render()
+        })
+      })()
+    </script>
+  `)
 }
 
-app.get('/', (req, res) => {
-  if (currentUser(req)) return res.redirect('/app')
-  res.type('html').send(loginPage())
+app.get('/', (_req, res) => {
+  res.set('Cache-Control', 'no-store')
+  res.type('html').send(chatPage())
 })
 
-app.post('/login', (req, res) => {
-  const username = String(req.body.username || '').trim()
-  const password = String(req.body.password || '')
-  const user = USERS.find((u) => u.username === username && u.password === password)
-  if (!user) return res.status(401).type('html').send(loginPage('Invalid username or password.'))
-  setSession(res, user.username)
-  res.redirect('/app')
+app.get('/api/openrouter/status', (_req, res) => {
+  res.set('Cache-Control', 'no-store')
+  res.json({ configured, ...(configured ? { model: MODEL_ID } : {}) })
 })
 
-app.get('/app', (req, res) => {
-  const user = currentUser(req)
-  if (!user) return res.redirect('/')
-  res.type('html').send(appPage(user))
-})
-
-app.post('/logout', (req, res) => {
-  clearSession(res, req)
-  res.redirect('/')
-})
-
-app.get('/api/bedrock/status', (req, res) => {
-  if (!currentUser(req)) return res.status(401).json({ error: 'Sign in to check the model connection.' })
-  res.json({ configured: bedrockConfigured, ...(bedrockConfigured ? { region: BEDROCK_REGION } : {}) })
-})
-
-app.post('/api/bedrock/chat', (req, res, next) => {
-  const user = currentUser(req)
-  if (!user) return res.status(401).json({ error: 'Sign in to use the chat.' })
-  if (!bedrockConfigured || !respondWithBedrock) {
-    return res.status(503).json({ error: 'Connect an Amazon Bedrock AI Model to this service in Canvas, then redeploy.' })
+app.post('/api/openrouter/chat', async (req, res) => {
+  if (!configured || !respondWithOpenRouter) {
+    return res.status(503).json({
+      error: 'Connect an OpenRouter AI Model to this service in Canvas, add its API key as a service secret, then redeploy.',
+    })
+  }
+  if (req.get('origin')) {
+    try {
+      if (new URL(req.get('origin')).host !== req.get('host')) {
+        return res.status(403).json({ error: 'Cross-origin chat requests are not allowed.' })
+      }
+    } catch {
+      return res.status(403).json({ error: 'Invalid request origin.' })
+    }
   }
 
-  const now = Date.now()
   const messages = req.body?.messages
   if (!Array.isArray(messages) || messages.length < 1 || messages.length > 12) {
     return res.status(400).json({ error: 'Send between 1 and 12 recent chat messages.' })
@@ -401,34 +274,35 @@ app.post('/api/bedrock/chat', (req, res, next) => {
       message.content.length <= 2000
   })
   if (!valid || messages[messages.length - 1].role !== 'user') {
-    return res.status(400).json({ error: 'Messages must alternate between user and assistant and end with your message.' })
+    return res.status(400).json({
+      error: 'Messages must alternate between user and assistant and end with your message.',
+    })
   }
 
-  const recent = (chatRequests.get(user.username) || []).filter((time) => now - time < 60_000)
-  if (recent.length >= 15) return res.status(429).json({ error: 'Chat limit reached. Try again in a minute.' })
-  recent.push(now)
-  chatRequests.set(user.username, recent)
+  const limit = checkRateLimit(req.ip || 'unknown')
+  if (limit === 'capacity') {
+    return res.status(503).json({ error: 'Chat is busy. Please try again shortly.' })
+  }
+  if (limit === 'limited') {
+    return res.status(429).json({ error: 'Chat limit reached. Try again in a minute.' })
+  }
 
-  respondWithBedrock(messages).then((reply) => {
+  try {
+    const reply = await respondWithOpenRouter(messages)
     res.json({ reply })
-  }).catch((err) => {
-    const failure = bedrockFailure(err)
+  } catch (err) {
+    const failure = openRouterFailure(err)
     console.error(JSON.stringify({
-      event: 'bedrock_chat_failed',
+      event: 'openrouter_chat_failed',
       code: failure.code,
       requestId: failure.requestId,
-      httpStatusCode: err?.$metadata?.httpStatusCode,
-      modelId: BEDROCK_MODEL_ID,
-      region: BEDROCK_REGION,
+      status: failure.status,
+      model: MODEL_ID,
       message: err?.message,
     }))
-    if (res.headersSent) return next(err)
-    res.status(502).json({
-      error: failure.message,
-      code: failure.code,
-      ...(failure.requestId ? { requestId: failure.requestId } : {}),
-    })
-  })
+    res.status(failure.status >= 400 && failure.status < 500 ? failure.status : 502)
+      .json({ error: failure.message, code: failure.code })
+  }
 })
 
 app.get('/healthz', (_req, res) => {
