@@ -1,16 +1,31 @@
 /**
- * Monolayer Canvas demo — public chat using the connected OpenRouter AI Model.
+ * Monolayer Canvas demo — public chat using the connected AI Model.
  */
 const express = require('express')
 const { createOpenRouterResponder, openRouterFailure } = require('./openrouter')
+const { createBedrockResponder, bedrockFailure } = require('./bedrock')
 
 const PORT = Number(process.env.PORT) || 3000
-const MODEL_ID = process.env.OPENROUTER_MODEL || process.env.AI_MODEL_ID || ''
+const AI_PROVIDER = process.env.AI_PROVIDER || ''
+const MODEL_ID = AI_PROVIDER === 'bedrock'
+  ? process.env.BEDROCK_MODEL_ID || process.env.AI_MODEL_ID || ''
+  : AI_PROVIDER === 'openrouter'
+    ? process.env.OPENROUTER_MODEL || process.env.AI_MODEL_ID || ''
+    : ''
+const BEDROCK_REGION = process.env.BEDROCK_REGION || ''
 const API_KEY = process.env.OPENROUTER_API_KEY || ''
-const configured = process.env.AI_PROVIDER === 'openrouter' && Boolean(MODEL_ID && API_KEY)
-const respondWithOpenRouter = configured
-  ? createOpenRouterResponder({ apiKey: API_KEY, modelId: MODEL_ID })
+const configured = AI_PROVIDER === 'openrouter'
+  ? Boolean(MODEL_ID && API_KEY)
+  : AI_PROVIDER === 'bedrock'
+    ? Boolean(MODEL_ID && BEDROCK_REGION)
+    : false
+const providerName = AI_PROVIDER === 'bedrock' ? 'Amazon Bedrock' : 'OpenRouter'
+const respondWithModel = configured
+  ? AI_PROVIDER === 'bedrock'
+    ? createBedrockResponder({ modelId: MODEL_ID, region: BEDROCK_REGION })
+    : createOpenRouterResponder({ apiKey: API_KEY, modelId: MODEL_ID })
   : null
+const modelFailure = AI_PROVIDER === 'bedrock' ? bedrockFailure : openRouterFailure
 const clientRequests = new Map()
 const globalRequests = []
 const CLIENT_REQUEST_LIMIT = 10
@@ -139,17 +154,17 @@ function layout(body) {
 function chatPage() {
   return layout(`
     <h1>Monolayer demo chat</h1>
-    <p>Try the OpenRouter AI Model connected to this service in Canvas.</p>
+    <p>Try the AI Model connected to this service in Canvas.</p>
     <section class="panel">
-      <h2 id="model-title">OpenRouter chat</h2>
+      <h2 id="model-title">Connected AI Model</h2>
       <p id="model-status" class="meta">Checking the connected AI Model…</p>
-      <p class="meta">Model usage is billed by OpenRouter based on its current rates.</p>
+      <p class="meta">Usage is billed by the selected provider based on its current rates.</p>
       <div class="chat">
         <div id="chat-log" class="chat-log" aria-live="polite" aria-label="Chat conversation"></div>
         <form id="chat-form">
           <label for="chat-message">Message</label>
           <textarea id="chat-message" maxlength="2000" required
-            placeholder="Ask a question to test the connected OpenRouter model"></textarea>
+            placeholder="Ask a question to test the connected model"></textarea>
           <div class="row">
             <button id="chat-submit" type="submit" disabled>Send</button>
             <button id="chat-clear" class="ghost" type="button" disabled>Clear chat</button>
@@ -181,19 +196,18 @@ function chatPage() {
           log.scrollTop = log.scrollHeight
           clear.disabled = busy || messages.length === 0
         }
-        fetch('/api/openrouter/status')
+        fetch('/api/model/status')
           .then(async (response) => {
             const data = await response.json()
             if (!response.ok) throw new Error(data.error || 'Could not check the model connection.')
             if (!data.configured) {
-              status.textContent = data.missing?.includes('OPENROUTER_API_KEY') &&
-                !data.missing.includes('AI_PROVIDER') && !data.missing.includes('AI_MODEL_ID')
-                ? 'The model is connected, but no OpenRouter key was injected. Verify its key was saved in AWS Secrets Manager, then deploy the Canvas connection again.'
-                : 'Connect an OpenRouter AI Model and deploy the staged Canvas changes. Canvas will redeploy this service.'
+              status.textContent = data.missing?.includes('OPENROUTER_API_KEY')
+                ? 'The OpenRouter model is connected, but its key was not injected. Verify the key was saved in AWS Secrets Manager, then deploy the Canvas connection again.'
+                : 'Connect an OpenRouter or Bedrock AI Model in Canvas, then deploy the staged changes.'
               return
             }
-            title.textContent = data.model
-            status.textContent = 'Connected to OpenRouter. Send a message to test the model.'
+            title.textContent = data.provider + ' · ' + data.model
+            status.textContent = 'Connected to ' + data.provider + '. Send a message to test the model.'
             modelReady = true
             submit.disabled = false
           })
@@ -210,13 +224,13 @@ function chatPage() {
           submit.disabled = true
           render()
           try {
-            const response = await fetch('/api/openrouter/chat', {
+            const response = await fetch('/api/model/chat', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ messages: messages.slice(-12) }),
             })
             const data = await response.json()
-            if (!response.ok) throw new Error(data.error || 'The OpenRouter request failed.')
+            if (!response.ok) throw new Error(data.error || 'The model request failed.')
             messages.push({ role: 'assistant', content: data.reply })
             if (messages.length > 12) messages.splice(0, messages.length - 12)
           } catch (cause) {
@@ -244,19 +258,27 @@ app.get('/', (_req, res) => {
   res.type('html').send(chatPage())
 })
 
-app.get('/api/openrouter/status', (_req, res) => {
+function modelStatus(_req, res) {
   res.set('Cache-Control', 'no-store')
   const missing = []
-  if (process.env.AI_PROVIDER !== 'openrouter') missing.push('AI_PROVIDER')
-  if (!MODEL_ID) missing.push('AI_MODEL_ID')
-  if (!API_KEY) missing.push('OPENROUTER_API_KEY')
-  res.json({ configured, missing, ...(configured ? { model: MODEL_ID } : {}) })
-})
+  if (AI_PROVIDER !== 'openrouter' && AI_PROVIDER !== 'bedrock') missing.push('AI_PROVIDER')
+  if (!MODEL_ID) missing.push(AI_PROVIDER === 'bedrock' ? 'BEDROCK_MODEL_ID' : 'AI_MODEL_ID')
+  if (AI_PROVIDER === 'openrouter' && !API_KEY) missing.push('OPENROUTER_API_KEY')
+  if (AI_PROVIDER === 'bedrock' && !BEDROCK_REGION) missing.push('BEDROCK_REGION')
+  res.json({
+    configured,
+    missing,
+    ...(AI_PROVIDER === 'openrouter' || AI_PROVIDER === 'bedrock'
+      ? { provider: providerName }
+      : {}),
+    ...(configured ? { model: MODEL_ID } : {}),
+  })
+}
 
-app.post('/api/openrouter/chat', async (req, res) => {
-  if (!configured || !respondWithOpenRouter) {
+async function modelChat(req, res) {
+  if (!configured || !respondWithModel) {
     return res.status(503).json({
-      error: 'Connect an OpenRouter AI Model to this service in Canvas, add its API key as a service secret, then redeploy.',
+      error: 'Connect an OpenRouter or Bedrock AI Model to this service in Canvas, then deploy the staged changes.',
     })
   }
   if (req.get('origin')) {
@@ -295,22 +317,25 @@ app.post('/api/openrouter/chat', async (req, res) => {
   }
 
   try {
-    const reply = await respondWithOpenRouter(messages)
+    const reply = await respondWithModel(messages)
     res.json({ reply })
   } catch (err) {
-    const failure = openRouterFailure(err)
+    const failure = modelFailure(err)
     console.error(JSON.stringify({
-      event: 'openrouter_chat_failed',
+      event: 'ai_model_chat_failed',
       code: failure.code,
       requestId: failure.requestId,
       status: failure.status,
+      provider: AI_PROVIDER,
       model: MODEL_ID,
-      message: err?.message,
     }))
     res.status(failure.status >= 400 && failure.status < 500 ? failure.status : 502)
       .json({ error: failure.message, code: failure.code })
   }
-})
+}
+
+app.get(['/api/model/status', '/api/openrouter/status'], modelStatus)
+app.post(['/api/model/chat', '/api/openrouter/chat'], modelChat)
 
 app.get('/healthz', (_req, res) => {
   res.json({ ok: true })
