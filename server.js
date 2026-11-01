@@ -186,7 +186,10 @@ function chatPage() {
             const data = await response.json()
             if (!response.ok) throw new Error(data.error || 'Could not check the model connection.')
             if (!data.configured) {
-              status.textContent = 'Connect an OpenRouter AI Model to this service in Canvas, then redeploy.'
+              status.textContent = data.missing?.includes('OPENROUTER_API_KEY') &&
+                !data.missing.includes('AI_PROVIDER') && !data.missing.includes('AI_MODEL_ID')
+                ? 'The model is connected, but no OpenRouter key was injected. Verify its key was saved in AWS Secrets Manager, then deploy the Canvas connection again.'
+                : 'Connect an OpenRouter AI Model and deploy the staged Canvas changes. Canvas will redeploy this service.'
               return
             }
             title.textContent = data.model
@@ -243,7 +246,11 @@ app.get('/', (_req, res) => {
 
 app.get('/api/openrouter/status', (_req, res) => {
   res.set('Cache-Control', 'no-store')
-  res.json({ configured, ...(configured ? { model: MODEL_ID } : {}) })
+  const missing = []
+  if (process.env.AI_PROVIDER !== 'openrouter') missing.push('AI_PROVIDER')
+  if (!MODEL_ID) missing.push('AI_MODEL_ID')
+  if (!API_KEY) missing.push('OPENROUTER_API_KEY')
+  res.json({ configured, missing, ...(configured ? { model: MODEL_ID } : {}) })
 })
 
 app.post('/api/openrouter/chat', async (req, res) => {
